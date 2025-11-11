@@ -1,8 +1,10 @@
 
 var braid_fetch = require('braid-http').fetch
 
-// var url = 'https://dt.braid.org/zz'
 var url = 'https://braid.org/apps/ethersync'
+var cursor_url = 'https://braid.org/.well-known/cursor/apps/ethersync'
+
+var peer = Math.random().toString(36).slice(2)
 
 // Main execution
 const server = new EthersyncServer();
@@ -82,8 +84,7 @@ function EthersyncServer() {
         try {
           const message = JSON.parse(body);
 
-          if (message.method !== 'cursor')
-            console.error('Received RPC:', JSON.stringify(message, null, 2));
+          console.error('Received RPC:', JSON.stringify(message, null, 2));
           
           // Process the message
           if (message.method === 'open') {
@@ -93,7 +94,7 @@ function EthersyncServer() {
           } else if (message.method === 'edit') {
             this.handleEdit(message);
           } else if (message.method === 'cursor') {
-            console.error('Cursor update received');
+            this.handleCursor(message);
           }
           
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -149,6 +150,42 @@ function EthersyncServer() {
 
       fileState.braidClient = braidClient;
 
+      // Create cursor client
+      braid_fetch(cursor_url, {
+        subscribe: true,
+        peer,
+        headers: {
+          'selection-sharing-prototype': 'true',
+          'Accept': 'text/plain' // necessary for braid.org
+          // 'Cookie': 'client=...'
+        }
+      }).then(r => {
+        r.subscribe(update => {
+          console.log(`got update = ${JSON.stringify(update.body_text, null, 4)}`)
+
+          var x = JSON.parse(update.body_text)
+          for (var [userid, selection] of Object.entries(x)) {
+            this.broadcastMessage({
+              jsonrpc: '2.0',
+              method: 'cursor',
+              params: {
+                uri,
+                userid,
+                name: selection.name || 'Test Name',
+                ranges: selection.ranges.map(x => {
+                  return {
+                    start: offset_to_line_char(x[0], braidClient.get_unconfirmed_text()),
+                    end: offset_to_line_char(x[1], braidClient.get_unconfirmed_text()),
+                  }
+                })
+              }
+            });                      
+          }
+        }, (e) => {
+          console.log('ERR: ', e)
+        })
+      })
+
       // Send success response
       this.broadcastMessage({
         jsonrpc: '2.0',
@@ -168,7 +205,7 @@ function EthersyncServer() {
           delta: [{
             range: {
               start: offset_to_line_char(0, initial_content),
-              end: offset_to_line_char(initial_content.length, initial_content)
+              end: offset_to_line_char([...initial_content].length, initial_content)
             },
             replacement: ''
           }]
@@ -212,6 +249,42 @@ function EthersyncServer() {
       fileState.braidClient.changed(revision - fileState.last_seen_revision, delta)
       fileState.last_seen_revision = revision
       fileState.editorRevision++;
+
+      // Send success response
+      this.broadcastMessage({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { success: true }
+      });
+    },
+
+    handleCursor(message) {
+      const { uri, ranges } = message.params;
+
+      const fileState = this.openFiles.get(uri);
+      if (!fileState) throw new Error(`Cursor received for unknown file: ${uri}`)
+      console.error(`Cursor edit received for ${uri}`);
+
+      braid_fetch(cursor_url, {
+        method: 'PUT',
+        peer,
+        headers: {
+          'selection-sharing-prototype': 'true',
+          'Content-Type': 'text/plain', // necessary for braid.org
+          // 'Cookie': 'client=...'
+        },
+        body: JSON.stringify({
+          [peer]: {
+            ranges: ranges.map(x => {
+              return [
+                line_char_to_offset(x.start, fileState.braidClient.get_unconfirmed_text()),
+                line_char_to_offset(x.end, fileState.braidClient.get_unconfirmed_text())
+              ]
+            }),
+            time: Date.now()
+          }
+        })
+      })
 
       // Send success response
       this.broadcastMessage({
@@ -317,6 +390,8 @@ function simpleton_client(url, {
       stop: async () => {
         ac.abort()
       },
+      get_unconfirmed_text: () => unconfirmed_text,
+      get_current_text: () => current_text,
       changed: async (num_confirmed_updates, delta) => {
         // get up to speed from unconfirmed updates..
         for (var u of unconfirmed_updates.slice(0, num_confirmed_updates)) {
@@ -364,7 +439,8 @@ function simpleton_client(url, {
                 var r = await braid_fetch(url, {
                     headers: {
                         "Merge-Type": "simpleton",
-                        ...(content_type ? {"Content-Type": content_type} : {})
+                        ...(content_type ? {"Content-Type": content_type} : {}),
+                        // "Cookie": 'client=...'
                     },
                     method: "PUT",
                     retry: (res) => res.status !== 550,
@@ -395,7 +471,7 @@ function line_char_to_offset({line, character}, context) {
             codePointIndex - currentLineStart === character)
             return codePointIndex
 
-        if (i >= context.length) new Error(`Line ${line}, character ${character} is beyond the text`)
+        if (i >= context.length) throw new Error(`Line ${line}, character ${character} is beyond the text`)
 
         var char = context[i]
 
@@ -431,13 +507,11 @@ function offset_to_line_char(offset, context) {
     let i = 0
 
     while (true) {
-        if (codePointIndex === offset)
+        if (codePointIndex === offset || i >= context.length)
             return {
                 line: currentLine,
                 character: codePointIndex - currentLineStart,
             }
-        
-        if (i >= context.length) throw new Error(`Offset ${offset} is beyond the string length (${codePointIndex} code points)`)
 
         const char = context[i]
 
